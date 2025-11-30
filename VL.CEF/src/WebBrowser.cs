@@ -171,6 +171,32 @@ namespace VL.CEF
         }
 
         /// <summary>
+        /// Sets a global variable in the JavaScript context (window[name]).
+        /// The value will be parsed as JSON if possible, otherwise stored as a string.
+        /// Values are GUARANTEED to be injected into every new context BEFORE page scripts run,
+        /// ensuring data is available immediately even for early-loading scripts.
+        /// Values automatically survive navigation (LoadUrl/LoadString) and are reapplied to new contexts.
+        /// </summary>
+        /// <param name="name">The name of the global variable to set in window.</param>
+        /// <param name="jsonOrText">The data to set, typically a JSON string. If JSON parsing fails, it will be stored as a plain string.</param>
+        public void SetJsGlobal(string name, string jsonOrText)
+        {
+            if (string.IsNullOrEmpty(name))
+                throw new ArgumentException("Name cannot be null or empty.", nameof(name));
+            
+            if (jsonOrText == null)
+                throw new ArgumentNullException(nameof(jsonOrText), "Value cannot be null. Use empty string for empty values.");
+
+            using (var mainFrame = FBrowser.GetMainFrame())
+            {
+                var message = CefProcessMessage.Create("set-global");
+                message.Arguments.SetString(0, name);
+                message.Arguments.SetString(1, jsonOrText);
+                mainFrame.SendProcessMessage(CefProcessId.Renderer, message);
+            }
+        }
+
+        /// <summary>
         /// Returns true if the browser can navigate backwards.
         /// </summary>
         public bool CanGoBack => FBrowser.CanGoBack;

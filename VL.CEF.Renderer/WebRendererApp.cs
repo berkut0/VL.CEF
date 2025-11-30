@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Xilium.CefGlue;
@@ -191,6 +192,8 @@ namespace VL.CEF
 
             private readonly ConcurrentDictionary<(string request, int id), (CefV8Context context, CefV8Value onSuccess, CefV8Value onError)> queries = new ConcurrentDictionary<(string request, int id), (CefV8Context context, CefV8Value onSuccess, CefV8Value onError)>();
             private int queryCount;
+            // Store global variables for guaranteed injection into every new context (before page scripts run)
+            private readonly Dictionary<string, string> globalVariables = new Dictionary<string, string>();
 
             protected override bool OnProcessMessageReceived(CefBrowser browser, CefFrame frame, CefProcessId sourceProcess, CefProcessMessage message)
             {
@@ -201,6 +204,9 @@ namespace VL.CEF
                         return true;
                     case "query-response":
                         HandleQueryResponse(browser, frame, message);
+                        return true;
+                    case "set-global":
+                        HandleSetGlobal(browser, frame, message);
                         return true;
                     default:
                         return base.OnProcessMessageReceived(browser, frame, sourceProcess, message);
@@ -261,6 +267,13 @@ namespace VL.CEF
 
                             return default;
                         })));
+
+                        // Guaranteed injection: apply all global variables to the new context
+                        // This happens SYNCHRONOUSLY before any page scripts run, ensuring data is available immediately
+                        foreach (var kvp in globalVariables)
+                        {
+                            ApplyGlobalVariableToContext(window, frame, kvp.Key, kvp.Value);
+                        }
                     }
                 }
                 base.OnContextCreated(browser, frame, context);
@@ -320,6 +333,137 @@ namespace VL.CEF
                     CancellationToken.None,
                     TaskCreationOptions.None,
                     scheduler);
+            }
+
+            private void HandleSetGlobal(CefBrowser browser, CefFrame frame, CefProcessMessage message)
+            {
+                var name = message.Arguments.GetString(0);
+                var jsonOrText = message.Arguments.GetString(1);
+
+                // Validate inputs to prevent crashes
+                if (string.IsNullOrEmpty(name) || jsonOrText == null)
+                    return;
+
+                // Store the value for guaranteed injection into future contexts (OnContextCreated)
+                // This ensures data survives navigation and is available before page scripts run
+                globalVariables[name] = jsonOrText;
+
+                // Also apply to current context if it exists (immediate effect for already-loaded pages)
+                if (frame != null && frame.IsMain)
+                {
+                    var context = frame.V8Context;
+                    if (context != null && context.Enter())
+                    {
+                        try
+                        {
+                            using (var window = context.GetGlobal())
+                            {
+                                ApplyGlobalVariableToContext(window, frame, name, jsonOrText);
+                            }
+                        }
+                        finally
+                        {
+                            context.Exit();
+                        }
+                    }
+                    else
+                    {
+                        // Fallback to ExecuteJavaScript if context is not available yet
+                        ApplyGlobalVariable(frame, name, jsonOrText);
+                    }
+                }
+            }
+
+            private void ApplyGlobalVariable(CefFrame frame, string name, string jsonOrText)
+            {
+                // Escape the name and value for safe insertion into JavaScript
+                var escapedName = EscapeJavaScriptString(name);
+                var escapedValue = EscapeJavaScriptString(jsonOrText);
+
+                // Create JavaScript code that safely parses JSON or falls back to string
+                var js = "(function() {" +
+                    "try {" +
+                    "window[" + escapedName + "] = JSON.parse(" + escapedValue + ");" +
+                    "} catch (e) {" +
+                    "window[" + escapedName + "] = " + escapedValue + ";" +
+                    "}" +
+                    "})();";
+
+                frame.ExecuteJavaScript(js, string.Empty, 0);
+            }
+
+            private void ApplyGlobalVariableToContext(CefV8Value window, CefFrame frame, string name, string jsonOrText)
+            {
+                // Apply directly to V8 context using window.SetValue (works immediately for data URLs)
+                // This is more reliable than ExecuteJavaScript in OnContextCreated
+                try
+                {
+                    CefV8Value value;
+                    // Try to parse as JSON first
+                    try
+                    {
+                        var parsed = JsonSerializer.Deserialize<JsonElement>(jsonOrText);
+                        value = JsonElementToV8Value(parsed);
+                    }
+                    catch
+                    {
+                        // If parsing fails, use as string
+                        value = CefV8Value.CreateString(jsonOrText);
+                    }
+                    window.SetValue(name, value);
+                }
+                catch
+                {
+                    // Fallback to ExecuteJavaScript if SetValue fails (shouldn't happen normally)
+                    // This can happen if window is not fully initialized
+                    if (frame != null)
+                        ApplyGlobalVariable(frame, name, jsonOrText);
+                }
+            }
+
+            private CefV8Value JsonElementToV8Value(JsonElement element)
+            {
+                switch (element.ValueKind)
+                {
+                    case JsonValueKind.Null:
+                        return CefV8Value.CreateNull();
+                    case JsonValueKind.True:
+                        return CefV8Value.CreateBool(true);
+                    case JsonValueKind.False:
+                        return CefV8Value.CreateBool(false);
+                    case JsonValueKind.Number:
+                        if (element.TryGetInt32(out int intValue))
+                            return CefV8Value.CreateInt(intValue);
+                        if (element.TryGetDouble(out double doubleValue))
+                            return CefV8Value.CreateDouble(doubleValue);
+                        return CefV8Value.CreateString(element.GetRawText());
+                    case JsonValueKind.String:
+                        return CefV8Value.CreateString(element.GetString());
+                    case JsonValueKind.Array:
+                        var array = CefV8Value.CreateArray(element.GetArrayLength());
+                        int index = 0;
+                        foreach (var item in element.EnumerateArray())
+                        {
+                            array.SetValue(index++, JsonElementToV8Value(item));
+                        }
+                        return array;
+                    case JsonValueKind.Object:
+                        var obj = CefV8Value.CreateObject();
+                        foreach (var prop in element.EnumerateObject())
+                        {
+                            obj.SetValue(prop.Name, JsonElementToV8Value(prop.Value));
+                        }
+                        return obj;
+                    default:
+                        return CefV8Value.CreateString(element.GetRawText());
+                }
+            }
+
+            private string EscapeJavaScriptString(string value)
+            {
+                // Use JSON.stringify to safely escape the string for JavaScript
+                // This handles quotes, newlines, and other special characters
+                return JsonSerializer.Serialize(value);
             }
 
             private void HandleQueryResponse(CefBrowser browser, CefFrame frame, CefProcessMessage message)
